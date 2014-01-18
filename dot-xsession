@@ -1,0 +1,23 @@
+# -*- Mode: Shell-script; tab-width: 4 -*-
+#
+# A ~/.xsession file suitable for running this at boot time.
+# Configure the Pi to boot to a graphical interface and install
+# this ~/.xsession in the 'pi' user's home directory (or create
+# a new user account, and configure lightdm to autologin that
+# user instead.
+
+# You may wish to dsable the X11 screensaver
+# (if xset is installed)
+if hash xset > /dev/null 2>&1; then
+    xset s off
+    xset -dpms
+    xset s noblank
+fi
+
+# If you did create a new account for this, you could also wrap this
+# inside a "while true; do" loop so that "Quit" in raspberry-piano
+# never gets back to the lightdm login screen.  I consider this a
+# feature, since it's helpful to log in as a real user sometimes to
+# fix things.
+
+/usr/bin/raspberry-piano
