@@ -1,0 +1,3 @@
+raspberry-piano usr/bin
+raspberry-piano.ui usr/share/raspberry-piano
+dot-xsession usr/share/raspberry-piano

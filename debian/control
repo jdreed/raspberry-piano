@@ -1,0 +1,20 @@
+Source: raspberry-piano
+Section: misc
+Priority: extra
+Maintainer: Jonathan Reed <jdreed@mit.edu>
+Build-Depends: debhelper (>= 7.0.50~), 
+Standards-Version: 3.9.3
+
+Package: raspberry-piano
+Architecture: all
+Depends: ${misc:Depends},
+ python,
+ gir1.2-gtk-3.0,
+ gir1.2-gdkpixbuf-2.0,
+ python-support (>= 0.90),
+ python-gi,
+Recommends: x11-apps,
+ imagemagick,
+Description: Digital sheet-music management and display for the Pi
+ This package provides sheet music display and management software
+ suitable for a digital display on top of a piano.
