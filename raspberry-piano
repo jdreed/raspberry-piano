@@ -1,23 +1,120 @@
 #!/usr/bin/python
 
-import sys
-import os
+import errno
+import json
 import logging
-import subprocess
-import shutil
+import os
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import uuid
+
 from optparse import OptionParser
 
 from gi.repository import Gtk, Gdk, GLib, GdkPixbuf
 
 
-DEFAULT_UI_FILE=''
+DEFAULT_UI_FILE='/usr/share/raspberry-piano/raspberry-piano.ui'
 DEFAULT_MUSIC_DIRECTORY="~/sheet-music"
+LIBRARY_INDEX_FILE="index.json"
 METADATA_FILENAME="meta.txt"
 
-logger = logging.getLogger('piano')
+logger = logging.getLogger('raspberry-piano')
+
+def gtk_editable_append_text(editable, text):
+    """Convenience function to append text"""
+    editable.insert_text(text,
+                         len(editable.get_text()))
+
+class PDFConverter:
+    def __init__(self, filename):
+        self.filename = filename
+        self.thumbnail = None
+        self._info = {'pages': -1,
+                     }
+
+    def get_thumbnail(self, percent=25):
+        fd, self.thumbnail = tempfile.mkstemp(suffix='.png')
+        os.close(fd)
+        try:
+            subprocess.check_call(['convert',
+                                   '-quality',
+                                   '00',
+                                   '-density',
+                                   '72x72',
+                                   '-resize',
+                                   '{0}%'.format(percent),
+                                   '{0}[0]'.format(self.filename),
+                                   self.thumbnail])
+        except subprocess.CalledProcessError as e:
+            logger.warn("Error creating thumbnail: %s", str(e))
+            return None
+        return GdkPixbuf.Pixbuf.new_from_file(self.thumbnail)
+
+    def get_info(self):
+        try:
+            npages = subprocess.check_output(['identify',
+                                              '-format',
+                                              '%n',
+                                              self.filename])
+            self._info['pages'] = int(npages.strip())
+        except subprocess.CalledProcessError as e:
+            logger.debug("Unable to get page count: %s", str(e))
+        except ValueError as e:
+            logger.warn("identify(1) returned non-numeric page count!: %s",
+                        str(e))
+        return self._info
+
+    def __del__(self):
+        if self.thumbnail is not None:
+            try:
+                os.unlink(self.thumbnail)
+            except OSError as e:
+                logger.warn("%s while deleting thumbnail", str(e))
+                
+    def convert(self, destdir, dpi, extra_options=None):
+        args = ['convert',
+                '-quality',
+                '00',
+                '-density',
+                "%{:.0f}x{:.0f}".format(dpi, dpi)]
+        if extra_options is not None:
+            args += extra_options.split()
+        args += [self.filename,
+                 "{0}/page-%d.png".format(destdir)]
+        try: 
+            logger.debug("Running: %s", str(args))
+            subprocess.check_call(args)
+        except subprocess.CalledProcessError as e:
+            logger.warn("Error converting PDF: %s", str(e))
+            return False
+        return True
 
 class Dialog:
+    @staticmethod
+    def err(message, parent=None, fatal=False):
+        dlg = Gtk.MessageDialog(parent,
+                                Gtk.DialogFlags.MODAL,
+                                Gtk.MessageType.ERROR,
+                                Gtk.ButtonsType.CLOSE if fatal else Gtk.ButtonsType.OK,
+                                message)
+        dlg.set_title('Error')
+        dlg.run()
+        dlg.destroy()
+
+    @staticmethod
+    def warn(message, parent=None):
+        dlg = Gtk.MessageDialog(parent,
+                                Gtk.DialogFlags.MODAL,
+                                Gtk.MessageType.WARNING,
+                                Gtk.ButtonsType.OK,
+                                message)
+        dlg.set_title('Warning')
+        dlg.run()
+        dlg.destroy()
+
     @staticmethod
     def confirm(question, parent=None):
         dlg = Gtk.MessageDialog(parent,
@@ -25,6 +122,8 @@ class Dialog:
                                 Gtk.MessageType.QUESTION,
                                 Gtk.ButtonsType.YES_NO,
                                 question)
+     
+        dlg.set_title('Confirmation')
         rv = dlg.run() == Gtk.ResponseType.YES
         dlg.destroy()
         return rv
@@ -38,49 +137,102 @@ class ScreenInfo:
         return (float(monitorGeometry.x + monitorGeometry.width),
                 float(monitorGeometry.y + monitorGeometry.height))
 
-class MusicLibraryEntry:
-    pass
+# TODO: Less dumb
+class MusicLibraryEntry(dict):
+    def __init__(self):
+        super(MusicLibraryEntry, self).__init__()
+        self['title'] = None
+        self['dir'] = None
+        self['notes'] = ''
+        self['files'] = []
+        self['uuid'] = str(uuid.uuid1())
+
+    def __setattr__(self, name, value):
+        self[name] = value
+    
+    def __getattr__(self, name):
+        if name in self:
+            return self[name]
+        else:
+            raise AttributeError(name)
+
+    def load_json(self, json_str):
+        self.update(json.loads(json_str))
+        
 
 class MusicLibrary:
+    valid_dir_chars = re.compile(r'[^\w\-\._]+')
     @staticmethod
-    def is_valid_dir(path):
-        return os.path.exists(os.path.join(path, METADATA_FILENAME))
-
+    def validate_dirname(path):
+        return MusicLibrary.valid_dir_chars.sub('', 
+                                                path.lower().replace(' ',
+                                                                     '_'))
     def __init__(self, directory):
         self.directory = directory
         logger.debug("Using '%s' as music directory", self.directory)
+        self.indexfile = os.path.join(self.directory, LIBRARY_INDEX_FILE)
         self.entries = []
+        if not os.path.exists(directory):
+            if not Dialog.confirm("{0} does not exist.  Create it?".format(directory)):
+                sys.exit(0)
+            try:
+                os.mkdir(directory)
+                with open(self.indexfile, 'a'):
+                    pass
+            except OSError as e:
+                logger.debug("os.mkdir threw %s", str(e))
+                Dialog.err("Could not create {0}.  Cannot continue.".format(directory), fatal=True)
+                sys.exit(0)
+            except IOError as e:
+                logger.debug("os.mkdir threw %s", str(e))
+                Dialog.err("Could not create index file.  Cannot continue.".format(directory), fatal=True)
+                sys.exit(0)
+            
+        if not os.path.isdir(directory):
+            Dialog.err("{0} exists but is not a directory.\nMove it out of the way, or select a new music directory.".format(directory), fatal=True)
+            sys.exit(0)
         self.refresh()
 
+    def delete(self, entry):
+        del self.entries[entry.uuid]
+        shutil.rmtree(entry.dir)
+        self.update()
+        self.refresh()
+
+    def add(self, entry):
+        self.entries[entry.uuid] = entry
+        self.update()
+        self.refresh()
+
+    def update(self):
+        try:
+            shutil.copyfile(self.indexfile, self.indexfile+'.bak')
+        except shutil.Error as e:
+            logger.debug("Failed to back up index: %s", str(e))
+        try:
+            with open(self.indexfile, 'w') as f:
+                for e in self.entries.values():
+                    f.write(json.dumps(e) + "\n")
+        except IOError as e:
+            logger.debug("%s while updating index", str(e))
+            Dialog.err("Unable to write new index file.  Old index has been saved as {0}.bak.  Cannot continue.".format(self.indexfile), fatal=True)
+            Gtk.main_quit()
+
     def refresh(self):
-        self.entries = []
-        # TODO: realpath/abspath
-        for d in [ os.path.join(self.directory, name) for name in 
-                   os.listdir(self.directory) if os.path.isdir(os.path.join(
-                    self.directory, name))]:
-            if not MusicLibrary.is_valid_dir(d):
-                logger.debug("Skipping %s", d)
-                continue
-            entry = MusicLibraryEntry()
-            entry.title = None
-            entry.dir = None
-            entry.files = []
-            try:
-                with open(os.path.join(d, METADATA_FILENAME), 'r') as metadata:
-                    lines = metadata.readlines()
-                    entry.title = lines.pop(0).strip()
-                    entry.dir = d
-                    for i in lines:
-                        filename = os.path.join(d, i.strip())
-                        entry.files.append(filename)
-            except IOError as e:
-                logger.warn("Could not load metadata: " + d)
-
-            if entry.title is not None:
-                self.entries.append(entry)
-
+        self.entries = {}
+        try:
+            with open(self.indexfile, 'r') as idx:
+                for line in idx.readlines():
+                    entry = MusicLibraryEntry()
+                    entry.load_json(line)
+                    if entry.title is not None:
+                        self.entries[entry.uuid] = entry
+        except IOError as e:
+            Dialog.err("Unable to read index file.  Cannot continue.", fatal=True)
+            sys.exit(0)
+    
     def __iter__(self):
-        return iter(self.entries)
+        return iter(self.entries.values())
 
 class Music:
     def __init__(self, library_entry):
@@ -122,7 +274,7 @@ class Music:
         # Range selector is length, not index
         return self.pixbufs[self.page:self.page + 2]
 
-class MusicWindow:
+class RaspberryPiano:
     def __init__(self, options):
         self.music_dir = os.path.abspath(os.path.expanduser(options.music_dir))
         self.builder = Gtk.Builder()
@@ -139,14 +291,115 @@ class MusicWindow:
         rw = Gdk.get_default_root_window()
         rw.set_cursor(Gdk.Cursor(Gdk.CursorType.LEFT_PTR))
         self.main_window.show()
-        self.refresh_library()
+        self.refresh_listview()
 
-    def refresh_library(self, force=False):
-        if force:
-            self.library.refresh()
+    def refresh_listview(self):
         self.music_liststore.clear()
         for entry in self.library:
-            self.music_liststore.append((entry, entry.title))
+            self.music_liststore.append((entry,
+                                         entry.title,
+                                         len(entry.files),
+                                         entry.notes))
+
+    def img_destdir_entry_insert_text_cb(self, widget, text, text_len,
+                                     pointer, data=None):
+        if text_len == 0:
+            return True
+        if re.search(r'[^\w\-\._]', text):
+            widget.error_bell()
+            widget.set_icon_from_stock(Gtk.EntryIconPosition.SECONDARY,
+                                       'gtk-dialog-warning')
+            widget.set_icon_activatable(Gtk.EntryIconPosition.SECONDARY,
+                                        False)
+            widget.set_icon_tooltip_text(Gtk.EntryIconPosition.SECONDARY,
+                                         "Only letters, numbers, hyphen, dot, underscore")
+            widget.stop_emission('insert-text')
+        else:
+            widget.set_icon_from_stock(Gtk.EntryIconPosition.SECONDARY,
+                                       None)
+        return True
+
+    def img_destdir_use_title_toggled_cb(self, widget):
+        self.builder.get_object('img_destdir_entry').set_sensitive(not widget.get_active())
+        self.auto_populate_img_destdir = widget.get_active()
+        if self.auto_populate_img_destdir:
+            self.builder.get_object('img_destdir_entry').set_text(MusicLibrary.validate_dirname(self.builder.get_object('img_title_entry').get_text()))
+            
+
+    def img_title_entry_delete_text_cb(self, widget, start, end):
+        if not self.auto_populate_img_destdir:
+            return True
+        nchars = len(MusicLibrary.validate_dirname(widget.get_chars(start, end)))
+        if nchars > 0:
+            end = len(self.builder.get_object('img_destdir_entry').get_text())
+            self.builder.get_object('img_destdir_entry').delete_text(end - nchars, end)
+
+    def img_title_entry_insert_text_cb(self, widget, text, text_len,
+                                   pointer, data=None):
+        if not self.auto_populate_img_destdir:
+            return True
+        gtk_editable_append_text(self.builder.get_object('img_destdir_entry'),
+                                 MusicLibrary.validate_dirname(text))
+        
+
+    def import_images_btn_clicked_cb(self, widget, data=None):
+        dlg = self.builder.get_object("open_images_filechooser_dlg")
+        liststore = self.builder.get_object('file_liststore')
+        liststore.clear()
+        rv = dlg.run()
+        dlg.hide()
+        if rv != Gtk.ResponseType.OK:
+            return True
+        # Dialog ensures we get at least one filename
+        for f in dlg.get_filenames():
+            liststore.append((f, os.path.basename(f)))
+        # Reset the add dialog
+        self.auto_populate_img_destdir = True
+        entry = self.builder.get_object("img_title_entry")
+        entry.set_text('')
+        self.builder.get_object('img_notes_entry').set_text('')
+        dlg = self.builder.get_object('import_images_dlg')
+        while True:
+            rv = dlg.run()
+            if rv != Gtk.ResponseType.OK:
+                dlg.hide()
+                return True
+            destdir = self.builder.get_object('img_destdir_entry').get_text()
+            if len(entry.get_text().strip()) < 1:
+                Dialog.warn("You must specify a title.")
+                continue
+            if len(destdir.strip()) < 1:
+                Dialog.warn("You must specify a directory.")
+                continue
+            destpath = os.path.join(self.music_dir, destdir)
+            try:
+                logger.debug("mkdir %s", destpath)
+                os.mkdir(destpath)
+                break
+            except OSError as e:
+                logger.debug("os.mkdir threw %s", str(e))
+                if e.errno == errno.EEXIST:
+                    Dialog.warn("'{0}' exists in the library.\nPick a new name.".format(destpath))
+                else:
+                    Dialog.err("Unable to create directory.")
+                    dlg.hide()
+                    return True
+        dlg.hide()
+        # TODO: Threads
+        self.builder.get_object('please_wait_dlg').show_all()
+        while Gtk.events_pending():
+            Gtk.main_iteration()
+        libentry = MusicLibraryEntry()
+        libentry.title = entry.get_text()
+        libentry.dir = destpath
+        libentry.notes = self.builder.get_object('img_notes_entry').get_text()
+        libentry.files = [i[0] for i in liststore]
+        self.library.add(libentry)
+        self.refresh_listview()
+        self.builder.get_object('please_wait_dlg').hide()
+        while Gtk.events_pending():
+            Gtk.main_iteration()
+
 
     def get_selected_music_entry(self):
         treeview = self.builder.get_object('music_treeview')
@@ -156,49 +409,135 @@ class MusicWindow:
         return self.music_liststore.get_value(
             self.music_liststore.get_iter(path), 0)
 
-    def add_btn_clicked_cb(self, widget, data=None):
+    def destdir_entry_insert_text_cb(self, widget, text, text_len,
+                                     pointer, data=None):
+        if text_len == 0:
+            return True
+        if re.search(r'[^\w\-\._]', text):
+            widget.error_bell()
+            widget.set_icon_from_stock(Gtk.EntryIconPosition.SECONDARY,
+                                       'gtk-dialog-warning')
+            widget.set_icon_activatable(Gtk.EntryIconPosition.SECONDARY,
+                                        False)
+            widget.set_icon_tooltip_text(Gtk.EntryIconPosition.SECONDARY,
+                                         "Only letters, numbers, hyphen, dot, underscore")
+            widget.stop_emission('insert-text')
+        else:
+            widget.set_icon_from_stock(Gtk.EntryIconPosition.SECONDARY,
+                                       None)
+        return True
+
+    def destdir_use_title_toggled_cb(self, widget):
+        self.builder.get_object('destdir_entry').set_sensitive(not widget.get_active())
+        self.auto_populate_destdir = widget.get_active()
+        if self.auto_populate_destdir:
+            self.builder.get_object('destdir_entry').set_text(MusicLibrary.validate_dirname(self.builder.get_object('title_entry').get_text()))
+            
+
+    def title_entry_delete_text_cb(self, widget, start, end):
+        if not self.auto_populate_destdir:
+            return True
+        nchars = len(MusicLibrary.validate_dirname(widget.get_chars(start, end)))
+        if nchars > 0:
+            end = len(self.builder.get_object('destdir_entry').get_text())
+            self.builder.get_object('destdir_entry').delete_text(end - nchars, end)
+
+    def title_entry_insert_text_cb(self, widget, text, text_len,
+                                   pointer, data=None):
+        if not self.auto_populate_destdir:
+            return True
+        gtk_editable_append_text(self.builder.get_object('destdir_entry'),
+                                 MusicLibrary.validate_dirname(text))
+        
+
+    def import_pdf_btn_clicked_cb(self, widget, data=None):
         dlg = self.builder.get_object("open_pdf_filechooser_dlg")
         rv = dlg.run()
         dlg.hide()
         if rv != Gtk.ResponseType.OK:
             return True
+        filename = dlg.get_filename()
+        converter = PDFConverter(filename)
+        npages = converter.get_info()['pages']
+        # Reset the add dialog
+        self.auto_populate_destdir = True
         entry = self.builder.get_object("title_entry")
         entry.set_text('')
-        filename = dlg.get_filename()
-        self.builder.get_object("filename_lbl").set_text(filename)
+        self.builder.get_object('dpi_spinbtn').set_value(96.0)
+        self.builder.get_object('extra_options_entry').set_text('')
+        self.builder.get_object('notes_entry').set_text('')
+        self.builder.get_object('preview_img').set_from_pixbuf(converter.get_thumbnail())
+        self.builder.get_object('file_info_lbl').set_text('{0} pages'.format(npages))
+        self.builder.get_object("filename_lbl").set_text(os.path.basename(filename))
         dlg = self.builder.get_object("add_music_dlg")
-        rv = dlg.run()
+        while True:
+            rv = dlg.run()
+            if rv != Gtk.ResponseType.OK:
+                dlg.hide()
+                return True
+            destdir = self.builder.get_object('destdir_entry').get_text()
+            destpath = os.path.join(self.music_dir, destdir)
+            if len(entry.get_text().strip()) < 1:
+                Dialog.warn("You must specify a title.")
+                continue
+            if len(destdir.strip()) < 1:
+                Dialog.warn("You must specify a directory.")
+                continue
+            try:
+                logger.debug("mkdir %s", destpath)
+                os.mkdir(destpath)
+                break
+            except OSError as e:
+                logger.debug("os.mkdir threw %s", str(e))
+                if e.errno == errno.EEXIST:
+                    Dialog.warn("'{0}' exists in the library.\nPick a new name.".format(destpath))
+                else:
+                    Dialog.err("Unable to create directory.")
+                    dlg.hide()
+                    return True
         dlg.hide()
+        # TODO: Threads
+        self.builder.get_object('please_wait_dlg').show_all()
+        while Gtk.events_pending():
+            Gtk.main_iteration()
+        logger.debug(destdir)
+        if not converter.convert(destpath, 
+                                 self.builder.get_object(
+                "dpi_spinbtn").get_value(),
+                                 self.builder.get_object(
+                'extra_options_entry').set_text('')):
+            Dialog.err('Conversion failed!')
+            return True
+        libentry = MusicLibraryEntry()
+        libentry.title = entry.get_text()
+        libentry.dir = destpath
+        libentry.notes = self.builder.get_object('notes_entry').get_text()
+        libentry.files = [os.path.join(destpath, x) for x in sorted(os.listdir(destpath), key=lambda y: int(re.search('\d+', y).group(0)))]
+        self.library.add(libentry)
+        self.refresh_listview()
+        self.builder.get_object('please_wait_dlg').hide()
+        while Gtk.events_pending():
+            Gtk.main_iteration()
+        
+
+    def edit_btn_clicked_cb(self, widget, data=None):
+        entry = self.get_selected_music_entry()
+        if entry is None:
+            widget.error_bell()
+            return True
+        self.builder.get_object("new_name_entry").set_text(entry.title)
+        self.builder.get_object("current_name_lbl").set_text(entry.title)
+        self.builder.get_object("edit_notes_entry").set_text(entry.notes)
+        rv = self.builder.get_object("edit_dlg").run()
+        self.builder.get_object("edit_dlg").hide()
         if rv != Gtk.ResponseType.OK:
             return True
-        dpi = self.builder.get_object("dpi_spinbtn").get_value()
-        #TODO: ensure directory doesn't exist, give options in dialog
-        destdir = os.path.join(self.music_dir,
-                               re.sub('\W+', '', entry.get_text()))
-        try:
-            os.mkdir(destdir)
-        except OSError as e:
-            logger.warn(e)
-        
-        try: 
-            subprocess.check_call(['convert',
-                                   '-quality',
-                                   '00',
-                                   '-density',
-                                   "%{:.0f}x{:.0f}".format(dpi, dpi),
-                                   filename,
-                                   "{0}/page-%d.png".format(destdir)])
-        except CalledProcessError as e:
-            logger.warn("Oops: %s", str(e))
-        files = os.listdir(destdir)
-        try: 
-            with open(os.path.join(destdir, METADATA_FILENAME), 'w') as f:
-                f.write(entry.get_text() + "\n")
-                f.writelines([ x + "\n" for x in sorted(files, key=lambda x: int(re.search('\d+', x).group(0)))])
-        except IOError as e:
-            logger.warn(e)
-        self.refresh_library(force=True)
-        
+        new_name = self.builder.get_object("new_name_entry").get_text()
+        if len(new_name.strip()) > 0:
+            entry.title = new_name
+        entry.notes = self.builder.get_object("edit_notes_entry").get_text()
+        self.library.update()
+        self.refresh_listview()
 
     def delete_btn_clicked_cb(self, widget, data=None):
         entry = self.get_selected_music_entry()
@@ -207,11 +546,10 @@ class MusicWindow:
             return True
         if not Dialog.confirm(
             "Permanently delete sheet music for \"{0}\"?".format(
-                entry.title),
-            self.main_window):
+                entry.title), self.main_window):
             return True
-        shutil.rmtree(entry.dir)
-        self.refresh_library(force=True)
+        self.library.delete(entry)
+        self.refresh_listview()
 
     def music_treeview_cursor_changed_cb(self, tree_view, data=None):
         tree_path = tree_view.get_cursor()[0]
@@ -268,7 +606,7 @@ class MusicWindow:
     def music_window_key_press_event_cb(self, widget, event):
         if event.keyval in (Gdk.KEY_Q, Gdk.KEY_q):
             self.music_window.hide()
-        if event.keyval in (Gdk.KEY_plus, Gdk.KEY_KP_Add):
+        if event.keyval in (Gdk.KEY_plus, Gdk.KEY_KP_Add, Gdk.KEY_space):
             self.turn_pages()
         elif event.keyval in (Gdk.KEY_minus, Gdk.KEY_KP_Subtract):
             self.turn_pages(True)
@@ -284,8 +622,7 @@ if __name__ == '__main__':
                       dest="ui_file")
     parser.add_option("--dir", action="store", dest="music_dir");
     (options, args) = parser.parse_args()
-    if options.debug:
-        logging.basicConfig(level=logging.DEBUG)
-    win = MusicWindow(options)
+    logging.basicConfig(level=logging.DEBUG if options.debug else logging.WARN)
+    win = RaspberryPiano(options)
     Gtk.main()
 
