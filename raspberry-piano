@@ -27,6 +27,10 @@ def gtk_editable_append_text(editable, text):
     editable.insert_text(text,
                          len(editable.get_text()))
 
+def flush_gtk_event_queue():
+    while Gtk.events_pending():
+        Gtk.main_iteration()
+
 class PDFConverter:
     def __init__(self, filename):
         self.filename = filename
@@ -386,8 +390,7 @@ class RaspberryPiano:
         dlg.hide()
         # TODO: Threads
         self.builder.get_object('please_wait_dlg').show_all()
-        while Gtk.events_pending():
-            Gtk.main_iteration()
+        flush_gtk_event_queue()
         libentry = MusicLibraryEntry()
         libentry.title = entry.get_text()
         libentry.dir = destpath
@@ -396,8 +399,7 @@ class RaspberryPiano:
         self.library.add(libentry)
         self.refresh_listview()
         self.builder.get_object('please_wait_dlg').hide()
-        while Gtk.events_pending():
-            Gtk.main_iteration()
+        flush_gtk_event_queue()
 
 
     def get_selected_music_entry(self):
@@ -459,6 +461,7 @@ class RaspberryPiano:
         converter = PDFConverter(filename)
         npages = converter.get_info()['pages']
         # Reset the add dialog
+        self.builder.get_object('please_wait_dlg').show_all()
         self.auto_populate_destdir = True
         entry = self.builder.get_object("title_entry")
         entry.set_text('')
@@ -468,6 +471,7 @@ class RaspberryPiano:
         self.builder.get_object('preview_img').set_from_pixbuf(converter.get_thumbnail())
         self.builder.get_object('file_info_lbl').set_text('{0} pages'.format(npages))
         self.builder.get_object("filename_lbl").set_text(os.path.basename(filename))
+        self.builder.get_object('please_wait_dlg').hide()
         dlg = self.builder.get_object("add_music_dlg")
         while True:
             rv = dlg.run()
@@ -497,8 +501,7 @@ class RaspberryPiano:
         dlg.hide()
         # TODO: Threads
         self.builder.get_object('please_wait_dlg').show_all()
-        while Gtk.events_pending():
-            Gtk.main_iteration()
+        flush_gtk_event_queue()
         logger.debug(destdir)
         if not converter.convert(destpath, 
                                  self.builder.get_object(
@@ -515,8 +518,7 @@ class RaspberryPiano:
         self.library.add(libentry)
         self.refresh_listview()
         self.builder.get_object('please_wait_dlg').hide()
-        while Gtk.events_pending():
-            Gtk.main_iteration()
+        flush_gtk_event_queue()
         
 
     def edit_btn_clicked_cb(self, widget, data=None):
