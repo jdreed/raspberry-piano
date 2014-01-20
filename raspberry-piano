@@ -19,7 +19,6 @@ from gi.repository import Gtk, Gdk, GLib, GdkPixbuf
 DEFAULT_UI_FILE='/usr/share/raspberry-piano/raspberry-piano.ui'
 DEFAULT_MUSIC_DIRECTORY="~/sheet-music"
 LIBRARY_INDEX_FILE="index.json"
-METADATA_FILENAME="meta.txt"
 
 logger = logging.getLogger('raspberry-piano')
 
