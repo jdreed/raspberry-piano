@@ -20,4 +20,6 @@ fi
 # feature, since it's helpful to log in as a real user sometimes to
 # fix things.
 
+# Start a window-manager
+/usr/bin/openbox &
 /usr/bin/raspberry-piano
