@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -295,6 +296,12 @@ class RaspberryPiano:
         rw.set_cursor(Gdk.Cursor(Gdk.CursorType.LEFT_PTR))
         self.main_window.show()
         self.refresh_listview()
+        try:
+            self.keyboard_pid = os.fork()
+            if self.keyboard_pid == 0:
+                os.execv("/usr/bin/matchbox-keyboard", ('matchbox-keyboard',))
+        except OSError as e:
+            print e
 
     def refresh_listview(self):
         self.music_liststore.clear()
@@ -626,4 +633,8 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.DEBUG if options.debug else logging.WARN)
     win = RaspberryPiano(options)
     Gtk.main()
-
+    if win.keyboard_pid:
+        try:
+            os.kill(win.keyboard_pid, signal.SIGTERM)
+        except OSError:
+            pass

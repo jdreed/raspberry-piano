@@ -813,6 +813,16 @@ options:</property>
       <action-widget response="-5">button7</action-widget>
     </action-widgets>
   </object>
+  <object class="GtkWindow" id="keyboard_window">
+    <property name="can_focus">False</property>
+    <property name="window_position">center</property>
+    <property name="skip_taskbar_hint">True</property>
+    <property name="skip_pager_hint">True</property>
+    <property name="decorated">False</property>
+    <child>
+      <placeholder/>
+    </child>
+  </object>
   <object class="GtkListStore" id="music_liststore">
     <columns>
       <!-- column-name directory -->
